@@ -1,0 +1,5 @@
+/build/
+/bench/
+__pycache__/
+*.py[cod]
+/AGENTS_LOCAL.md
