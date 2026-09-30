@@ -13,8 +13,8 @@ The project includes:
 
 ## Build and run
 
-Requirements: Linux, Clang 21 (the Makefile default), `make`, `ar`, and
-OpenSSL development headers/libraries.
+Requirements for the existing full Makefile build: Linux, Clang 21 (the
+Makefile default), `make`, `ar`, and OpenSSL development headers/libraries.
 
 ```sh
 make all broker
@@ -37,6 +37,39 @@ for more options.
 To use the client library, include `viart.h` (and `viart_rpc.h` for RPC) and
 link `build/libviart.a` with `-pthread -lssl -lcrypto`. See
 [`examples/demo.c`](examples/demo.c).
+
+### Optional components with Meson
+
+Meson and Ninja provide separate, reproducible build directories. The default
+Meson configuration preserves the full feature set:
+
+```sh
+CC=clang-21 meson setup build-full --buildtype=release
+meson compile -C build-full
+meson test -C build-full
+```
+
+For a small Unix/TCP-only client library and broker, without OpenSSL,
+WebSocket, broker management RPC, or the bundled MessagePack codec:
+
+```sh
+CC=clang-21 meson setup build-minimal --buildtype=release \
+    -Dws=false -Dbroker_rpc=false -Dcli=false -Ddemo=false
+meson compile -C build-minimal
+meson test -C build-minimal
+```
+
+The resulting broker is `build-minimal/viartd` and the client library is
+`build-minimal/libviart.a`; link this library with `-pthread` only. Builds
+without WS reject `--ws`, `--wss`, and token-map options, and client WS/WSS
+connections return `EOPNOTSUPP`. Disabling `broker_rpc` removes the `.broker`
+management methods and announcements, but not application RPC forwarding.
+The MessagePack implementation is bundled source, not an external dependency;
+the CLI uses it independently, so disable the CLI to omit it entirely.
+Currently both WS and WSS require OpenSSL, including plain WS handshake code.
+
+The Makefile remains available for the existing full-build and Python
+integration-test workflows. Keep Meson build directories separate from it.
 
 ## Test
 

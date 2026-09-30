@@ -1,4 +1,6 @@
 /build/
+/build-full/
+/build-minimal/
 /bench/
 __pycache__/
 *.py[cod]

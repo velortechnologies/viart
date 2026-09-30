@@ -4,9 +4,19 @@
 #include "acl.h"
 #include "auth.h"
 #include "index.h"
+#ifndef VIART_WITH_WS
+#define VIART_WITH_WS 1
+#endif
+#ifndef VIART_WITH_BROKER_RPC
+#define VIART_WITH_BROKER_RPC 1
+#endif
+#if VIART_WITH_BROKER_RPC
 #include "rpc.h"
 #include "rpc_wire.h"
+#endif
+#if VIART_WITH_WS
 #include "ws.h"
+#endif
 #include "subscriptions.h"
 #include "wire.h"
 #include <errno.h>
@@ -14,7 +24,12 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#if VIART_WITH_WS
 #include <openssl/ssl.h>
+#else
+typedef void SSL;
+typedef void SSL_CTX;
+#endif
 #include <signal.h>
 #include <time.h>
 #include <sys/stat.h>
@@ -40,12 +55,17 @@ static int watch(broker *b,peer *p){struct epoll_event e={.events=(p->reject?0:E
  if(epoll_ctl(b->ep,EPOLL_CTL_MOD,p->fd,&e)<0)return -1;
  p->interest=e.events;return 0;}
 static int tls_handshake(broker *b,peer *p){
+#if VIART_WITH_WS
  if(p->stage!=-2)return 0;int n=SSL_accept(p->ssl);
  if(n==1){p->stage=-1;p->tls_want_write=false;return watch(b,p)<0?errno:0;}
  int err=SSL_get_error(p->ssl,n);
  if(err==SSL_ERROR_WANT_READ||err==SSL_ERROR_WANT_WRITE){p->tls_want_write=err==SSL_ERROR_WANT_WRITE;return watch(b,p)<0?errno:0;}
  return EPROTO;
+#else
+ (void)b;(void)p;return EOPNOTSUPP;
+#endif
 }
+#if VIART_WITH_WS
 static ssize_t peer_recv(peer *p,void *data,size_t len){
  if(!p->ssl)return recv(p->fd,data,len,0);
  int n=SSL_read(p->ssl,data,(int)(len>INT_MAX?INT_MAX:len));
@@ -54,13 +74,18 @@ static ssize_t peer_recv(peer *p,void *data,size_t len){
  if(err==SSL_ERROR_WANT_READ||err==SSL_ERROR_WANT_WRITE){p->tls_read_want_write=err==SSL_ERROR_WANT_WRITE;errno=EAGAIN;return -1;}
  if(err==SSL_ERROR_ZERO_RETURN)return 0;errno=EIO;return -1;
 }
+#endif
 static ssize_t peer_send(peer *p,const void *data,size_t len){
+#if VIART_WITH_WS
  if(!p->ssl)return send(p->fd,data,len,MSG_NOSIGNAL);
  int n=SSL_write(p->ssl,data,(int)(len>INT_MAX?INT_MAX:len));
  if(n>0){p->tls_write_want_read=false;return n;}
  int err=SSL_get_error(p->ssl,n);
  if(err==SSL_ERROR_WANT_READ||err==SSL_ERROR_WANT_WRITE){p->tls_write_want_read=err==SSL_ERROR_WANT_READ;errno=EAGAIN;return -1;}
  errno=EIO;return -1;
+#else
+ return send(p->fd,data,len,MSG_NOSIGNAL);
+#endif
 }
 static ssize_t peer_send_batch(peer *p,size_t budget){
  struct iovec iov[16];size_t count=0;
@@ -80,9 +105,11 @@ static int enqueue_raw(broker *b,peer *p,uint8_t *data,size_t len){
  if(watch(b,p)<0){p->closing=true;return errno;}return 0;
 }
 static int enqueue(broker *b,peer *p,uint8_t *data,size_t len){
+#if VIART_WITH_WS
  if(p->ws_ready){uint8_t *wrapped=NULL;size_t wrapped_len=0;
   int err=bp_ws_encode(2,data,len,&wrapped,&wrapped_len);free(data);if(err)return err;
   return enqueue_raw(b,p,wrapped,wrapped_len);}
+#endif
  return enqueue_raw(b,p,data,len);
 }
 static int enbyte(broker *b,peer *p,uint8_t value){uint8_t *x=malloc(1);if(!x)return ENOMEM;*x=value;return enqueue(b,p,x,1);}
@@ -118,6 +145,7 @@ static void publish_to(void *owner,void *context){
   ctx->command->target,ctx->command->target_len,ctx->payload,ctx->payload_len,&n);
  (void)enqueue(ctx->b,to,data,n);
 }
+#if VIART_WITH_BROKER_RPC
 static void announce(broker *b,const char *subject,const char *detail,const char *topic){
  struct timespec ts;clock_gettime(CLOCK_REALTIME,&ts);
  uint8_t *data=NULL;size_t len=0;
@@ -153,6 +181,11 @@ static int core_rpc(broker *b,peer *from,const bp_command *c){
  size_t wire_len=0;uint8_t *wire=bp_delivery(BP_MESSAGE,c->qos&2,".broker",NULL,0,rpc,rpc_len,&wire_len);
  free(rpc);return enqueue(b,from,wire,wire_len);
 }
+#else
+static void announce(broker *b,const char *subject,const char *detail,const char *topic){
+ (void)b;(void)subject;(void)detail;(void)topic;
+}
+#endif
 static int route(broker *b,peer *from,const bp_command *c,uint8_t *code){
  if(b->cfg.acl_path){bp_acl_action action=c->op==BP_MESSAGE?BP_ACL_P2P:c->op==BP_BROADCAST?BP_ACL_BROADCAST:BP_ACL_PUBLISH;
   char *target=strndup((const char *)c->target,c->target_len);if(!target)return ENOMEM;
@@ -167,7 +200,11 @@ static int route(broker *b,peer *from,const bp_command *c,uint8_t *code){
   }free(mask);return 0;
  }
  if(c->op==BP_MESSAGE){
+#if VIART_WITH_BROKER_RPC
   if(c->target_len==7&&!memcmp(c->target,".broker",7))return core_rpc(b,from,c);
+#else
+  if(c->target_len==7&&!memcmp(c->target,".broker",7)){*code=BP_ERR_NOT_REGISTERED;return 0;}
+#endif
   peer *to=byname(b,c->target,c->target_len);if(!to){*code=BP_ERR_NOT_REGISTERED;return 0;}
   size_t n=0;uint8_t *data=bp_delivery(BP_MESSAGE,c->qos&2,from->name,NULL,0,c->payload,c->payload_len,&n);
   if(enqueue(b,to,data,n))*code=BP_ERR_NOT_DELIVERED;return 0;}
@@ -200,9 +237,11 @@ static int process(broker *b,peer *p){for(;;){
        BP_ACL_CONNECT,NULL,p->ipv4,!p->tcp,p->uid)){
    if(enbyte(b,p,BP_ERR_ACCESS))return ENOMEM;p->reject=true;p->stage=4;return 0;
   }
+#if VIART_WITH_WS
   if(p->ssl&&b->tokens&&(!p->has_bearer||
       !bp_auth_check(b->tokens,p->primary_name?p->primary_name:p->name,p->bearer_digest))){
    if(enbyte(b,p,BP_ERR_ACCESS))return ENOMEM;p->reject=true;p->stage=4;return 0;}
+#endif
   if(enbyte(b,p,BP_OK))return ENOMEM;p->stage=3;
   if(!p->primary_name)announce(b,"reg",p->name,".broker/info");}
  else if(p->stage==4)return 0;
@@ -212,6 +251,7 @@ static int process(broker *b,peer *p){for(;;){
   consume(p,used);
  }
 }}
+#if VIART_WITH_WS
 static int ws_process(broker *b,peer *p){
  if(!p->ws_ready){
   if(p->ws_len>8192)return EMSGSIZE;
@@ -247,7 +287,9 @@ static int ws_process(broker *b,peer *p){
  }
  return 0;
 }
+#endif
 static int read_peer(broker *b,peer *p){if(p->stage==-2)return tls_handshake(b,p);size_t budget=65536;for(;;){
+#if VIART_WITH_WS
  if(p->ws){uint8_t data[8192];size_t want=sizeof(data);if(want>budget)want=budget;
   ssize_t n=peer_recv(p,data,want);
   if(n>0){p->last_rx_ms=now_ms();budget-=(size_t)n;
@@ -263,6 +305,7 @@ static int read_peer(broker *b,peer *p){if(p->stage==-2)return tls_handshake(b,p
   if(n==0)return ECONNRESET;if(errno==EAGAIN||errno==EWOULDBLOCK){if(p->ssl)(void)watch(b,p);return 0;}
   if(errno==EINTR)continue;return errno;
  }
+#endif
  if(p->in_cap==p->in_len){size_t cap=p->in_cap?p->in_cap*2:8192;size_t limit=p->stage<3?65538:b->cfg.max_frame+9;if(cap>limit)cap=limit;if(cap<=p->in_cap)return EMSGSIZE;
   uint8_t *next=realloc(p->in,cap);if(!next)return ENOMEM;p->in=next;p->in_cap=cap;}
  size_t want=p->in_cap-p->in_len;if(want>budget)want=budget;
@@ -283,14 +326,22 @@ static void drop(broker *b,peer *p){
  if(p->name&&!p->primary_name)announce(b,"unreg",p->name,".broker/info");
  if(p->name&&!p->primary_name)for(peer *other=b->peers;other;other=other->next)
   if(other!=p&&other->primary_name&&!strcmp(other->primary_name,p->name))other->closing=true;
- bp_index_drop_owner(&b->index,p);epoll_ctl(b->ep,EPOLL_CTL_DEL,p->fd,NULL);if(p->ssl)SSL_free(p->ssl);close(p->fd);b->count--;peer **ref=&b->peers;while(*ref&&*ref!=p)ref=&(*ref)->next;if(*ref)*ref=p->next;
+ bp_index_drop_owner(&b->index,p);epoll_ctl(b->ep,EPOLL_CTL_DEL,p->fd,NULL);
+#if VIART_WITH_WS
+ if(p->ssl)SSL_free(p->ssl);
+#endif
+ close(p->fd);b->count--;peer **ref=&b->peers;while(*ref&&*ref!=p)ref=&(*ref)->next;if(*ref)*ref=p->next;
  free(p->name);free(p->primary_name);free(p->in);free(p->ws_in);bp_sub_free(p->subs);bp_sub_free(p->exclusions);while(p->head){packet *next=p->head->next;free(p->head->data);free(p->head);p->head=next;}free(p);}
 static int accept_all(broker *b,int listener,bool tcp,bool ws,bool tls){for(;;){struct sockaddr_in remote; socklen_t remote_len=sizeof(remote);
  int fd=accept4(listener,tcp?(struct sockaddr *)&remote:NULL,tcp?&remote_len:NULL,SOCK_NONBLOCK|SOCK_CLOEXEC);if(fd<0)return errno==EAGAIN||errno==EWOULDBLOCK?0:errno;
  if(b->count>=b->cfg.max_clients){close(fd);continue;}
  if(tcp){int one=1;(void)setsockopt(fd,IPPROTO_TCP,TCP_NODELAY,&one,sizeof(one));}
  peer *p=calloc(1,sizeof(*p));if(!p){close(fd);return ENOMEM;}p->fd=fd;p->tcp=tcp;p->ws=ws;p->stage=tls?-2:ws?-1:0;p->ipv4=tcp?ntohl(remote.sin_addr.s_addr):0;p->born_ms=p->last_rx_ms=now_ms();p->next=b->peers;b->peers=p;b->count++;
+#if VIART_WITH_WS
  if(tls){p->ssl=SSL_new(b->tls_ctx);if(!p->ssl||SSL_set_fd(p->ssl,fd)!=1){drop(b,p);return EPROTO;}SSL_set_accept_state(p->ssl);}
+#else
+ (void)tls;
+#endif
  if(!tcp){struct ucred cred;socklen_t len=sizeof(cred);
   if(getsockopt(fd,SOL_SOCKET,SO_PEERCRED,&cred,&len)<0||len!=sizeof(cred)){drop(b,p);return EACCES;}
   p->uid=(uint32_t)cred.uid;}
@@ -308,13 +359,17 @@ static void unlink_owned(const broker *b){
 int main(int argc,char **argv){
  broker b={.ep=-1,.listener=-1,.tcp_listener=-1,.ws_listener=-1,.wss_listener=-1};
  if(bp_config_parse(argc,argv,&b.cfg)){fprintf(stderr,"usage: %s [-B /path/to/socket] [--tcp IPv4:PORT] [--ws IPv4:PORT] [--wss IPv4:PORT --tls-cert PEM --tls-key PEM] [--acl path] [--max-clients N] [--max-frame BYTES] [--max-queue BYTES] [--handshake-ms N] [--idle-ms N]\n",argv[0]);return 2;}
+ if(!VIART_WITH_WS&&(b.cfg.ws_bind||b.cfg.wss_bind||b.cfg.tokens_path)){
+  fprintf(stderr,"this build does not support WebSocket or TLS\n");return 2;}
  if(b.cfg.acl_path){int err=bp_acl_load(b.cfg.acl_path,&b.acl);if(err){fprintf(stderr,"ACL load failed: %s\n",strerror(err));return 2;}}
+#if VIART_WITH_WS
  if(b.cfg.tokens_path){int err=bp_auth_load(b.cfg.tokens_path,&b.tokens);if(err){fprintf(stderr,"token map load failed: %s\n",strerror(err));bp_acl_free(b.acl);return 2;}}
  if(b.cfg.wss_bind){b.tls_ctx=SSL_CTX_new(TLS_server_method());if(!b.tls_ctx)return 2;
   SSL_CTX_set_min_proto_version(b.tls_ctx,TLS1_2_VERSION);
   if(SSL_CTX_use_certificate_file(b.tls_ctx,b.cfg.tls_cert,SSL_FILETYPE_PEM)!=1||
      SSL_CTX_use_PrivateKey_file(b.tls_ctx,b.cfg.tls_key,SSL_FILETYPE_PEM)!=1||
      SSL_CTX_check_private_key(b.tls_ctx)!=1){fprintf(stderr,"TLS certificate/key load failed\n");SSL_CTX_free(b.tls_ctx);return 2;}}
+#endif
  signal(SIGTERM,on_signal);signal(SIGINT,on_signal);b.start_ms=now_ms();b.ep=epoll_create1(EPOLL_CLOEXEC);if(b.ep<0){perror("epoll");return 1;}
  if(b.cfg.socket_path){struct sockaddr_un addr={.sun_family=AF_UNIX};
   if(strlen(b.cfg.socket_path)>=sizeof(addr.sun_path)){fprintf(stderr,"socket path too long\n");close(b.ep);return 1;}
@@ -339,6 +394,7 @@ int main(int argc,char **argv){
   if(bind(b.tcp_listener,(struct sockaddr *)&addr,sizeof(addr))<0||listen(b.tcp_listener,128)<0)goto startup_fail;
   struct epoll_event e={.events=EPOLLIN,.data.ptr=&b.tcp_listener};
   if(epoll_ctl(b.ep,EPOLL_CTL_ADD,b.tcp_listener,&e)<0)goto startup_fail;}
+#if VIART_WITH_WS
  if(b.cfg.ws_bind){const char *colon=strrchr(b.cfg.ws_bind,':');char host[64];
   if(!colon||colon==b.cfg.ws_bind||(size_t)(colon-b.cfg.ws_bind)>=sizeof(host))goto startup_fail;
   memcpy(host,b.cfg.ws_bind,(size_t)(colon-b.cfg.ws_bind));host[colon-b.cfg.ws_bind]=0;
@@ -364,6 +420,7 @@ int main(int argc,char **argv){
   if(bind(b.wss_listener,(struct sockaddr *)&addr,sizeof(addr))<0||listen(b.wss_listener,128)<0)goto startup_fail;
   struct epoll_event e={.events=EPOLLIN,.data.ptr=&b.wss_listener};
   if(epoll_ctl(b.ep,EPOLL_CTL_ADD,b.wss_listener,&e)<0)goto startup_fail;}
+#endif
  while(run){struct epoll_event events[64];int n=epoll_wait(b.ep,events,64,200);if(n<0){if(errno==EINTR)continue;perror("epoll_wait");break;}
   for(int i=0;i<n;i++){peer *p=events[i].data.ptr;if(!p||p==(void *)&b.tcp_listener||p==(void *)&b.ws_listener||p==(void *)&b.wss_listener){
    int listener=!p?b.listener:p==(void *)&b.tcp_listener?b.tcp_listener:p==(void *)&b.ws_listener?b.ws_listener:b.wss_listener;
@@ -380,7 +437,15 @@ int main(int argc,char **argv){
  }
  announce(&b,"shutdown",NULL,".broker/warn");
  for(peer *p=b.peers;p;p=p->next)(void)write_peer(&b,p);
- while(b.peers)drop(&b,b.peers);bp_index_clear(&b.index);bp_acl_free(b.acl);bp_auth_free(b.tokens);if(b.listener>=0)close(b.listener);if(b.tcp_listener>=0)close(b.tcp_listener);if(b.ws_listener>=0)close(b.ws_listener);if(b.wss_listener>=0)close(b.wss_listener);if(b.tls_ctx)SSL_CTX_free(b.tls_ctx);close(b.ep);
+ while(b.peers)drop(&b,b.peers);bp_index_clear(&b.index);bp_acl_free(b.acl);
+#if VIART_WITH_WS
+ bp_auth_free(b.tokens);
+#endif
+ if(b.listener>=0)close(b.listener);if(b.tcp_listener>=0)close(b.tcp_listener);if(b.ws_listener>=0)close(b.ws_listener);if(b.wss_listener>=0)close(b.wss_listener);
+#if VIART_WITH_WS
+ if(b.tls_ctx)SSL_CTX_free(b.tls_ctx);
+#endif
+ close(b.ep);
  unlink_owned(&b);return 0;
 startup_fail:
  perror("socket/bind/listen/epoll_ctl");
@@ -388,8 +453,10 @@ startup_fail:
  if(b.tcp_listener>=0)close(b.tcp_listener);
  if(b.ws_listener>=0)close(b.ws_listener);
  if(b.wss_listener>=0)close(b.wss_listener);
+#if VIART_WITH_WS
  if(b.tls_ctx)SSL_CTX_free(b.tls_ctx);
  bp_auth_free(b.tokens);
+#endif
  close(b.ep);
  bp_acl_free(b.acl);
  unlink_owned(&b);

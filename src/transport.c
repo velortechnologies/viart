@@ -1,5 +1,10 @@
 #include "transport.h"
+#ifndef VIART_WITH_WS
+#define VIART_WITH_WS 1
+#endif
+#if VIART_WITH_WS
 #include "ws_bridge.h"
+#endif
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -47,7 +52,12 @@ int viart_transport_connect(const char *endpoint, bool *in_progress) {
 int viart_transport_connect_ex(const char *endpoint,const char *token,const char *ca_file,bool *in_progress){
  if(!endpoint||!in_progress)return -EINVAL;
  if(!strncmp(endpoint,"ws://",5)||!strncmp(endpoint,"wss://",6)){
-  *in_progress=false;return viart_ws_bridge_open(endpoint,token,ca_file);
+  *in_progress=false;
+#if VIART_WITH_WS
+  return viart_ws_bridge_open(endpoint,token,ca_file);
+#else
+  (void)token;(void)ca_file;return -EOPNOTSUPP;
+#endif
  }
  return viart_transport_connect(endpoint,in_progress);
 }

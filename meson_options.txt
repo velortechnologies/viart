@@ -1,0 +1,8 @@
+option('ws', type: 'boolean', value: true,
+       description: 'Build WebSocket/WSS transports (requires OpenSSL)')
+option('broker_rpc', type: 'boolean', value: true,
+       description: 'Build .broker management RPC and bundled MessagePack codec')
+option('cli', type: 'boolean', value: true,
+       description: 'Build the command-line client')
+option('demo', type: 'boolean', value: true,
+       description: 'Build the example client')
